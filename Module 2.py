@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module 2 (RDKit): SMILES -> 3D SDF
+Module 2 (RDKit): SMILES -> 3D SDF  [GRACEFUL STOP ENABLED]
 - No OpenBabel; uses RDKit ETKDGv3 + UFF/MMFF and atomic writes.
 - Inputs:
     - input/input.csv (id,smiles,notes,params_json)
@@ -13,15 +13,32 @@ Module 2 (RDKit): SMILES -> 3D SDF
     - 3D_Structures/<id>_rdkit.log  (overwritten each run)
     - Updates state/manifest.csv (sdf_* fields)
 
-Run:  python m2_smiles_to_sdf_rdkit.py
+Run:  python Module 2.py
 """
 
 from __future__ import annotations
 import csv
 import hashlib
 import json
+import signal
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
+
+# --- Graceful stop flags ---
+STOP_REQUESTED = False
+HARD_STOP = False
+
+def _handle_sigint(sig, frame):
+    global STOP_REQUESTED, HARD_STOP
+    if not STOP_REQUESTED:
+        STOP_REQUESTED = True
+        print("\n⏹️  Ctrl+C detected — finishing current ligand, then exiting cleanly...")
+        print("   (Press Ctrl+C again to stop immediately after a safe checkpoint.)")
+    else:
+        HARD_STOP = True
+        print("\n⏭️  Second Ctrl+C — will abort the loop ASAP and finalize outputs.")
+signal.signal(signal.SIGINT, _handle_sigint)
 
 # --- Required deps ---
 from rdkit import Chem
@@ -127,7 +144,6 @@ def config_hash() -> str:
     return hashlib.sha1("||".join(chunks).encode("utf-8")).hexdigest()[:10]
 
 # ------------------------------ Manifest -------------------------------------
-# If you've updated headers to 'tools_rdkit', use that; otherwise keep 'tools_obabel' empty.
 MANIFEST_FIELDS = [
     "id","smiles","inchikey",
     "admet_status","admet_reason",
@@ -265,85 +281,105 @@ def main():
         ids = list(id2smiles.keys())
 
     # Manifest
-    manifest = load_manifest()
+    manifest: dict[str, dict] = load_manifest()
     done, failed = 0, 0
 
-    for lig_id in ids:
-        smiles = id2smiles.get(lig_id, "")
-        out_sdf = (DIR_SDF / f"{lig_id}.sdf").resolve()
-        out_smi = out_sdf.with_suffix(".smi")
-        out_log = out_sdf.with_name(out_sdf.stem + "_rdkit.log")
+    try:
+        for idx, lig_id in enumerate(ids, 1):
+            # Respect user stop request
+            if STOP_REQUESTED:
+                print("🧾 Stop requested — finalizing after this checkpoint...")
+                break
+            if HARD_STOP:
+                print("🧾 Hard stop — exiting loop immediately after checkpoint...")
+                break
 
-        # Always overwrite .smi for transparency
-        out_smi.parent.mkdir(parents=True, exist_ok=True)
-        out_smi.write_text(smiles + "\n", encoding="utf-8")
+            smiles = id2smiles.get(lig_id, "")
+            out_sdf = (DIR_SDF / f"{lig_id}.sdf").resolve()
+            out_smi = out_sdf.with_suffix(".smi")
+            out_log = out_sdf.with_name(out_sdf.stem + "_rdkit.log")
 
-        # Skip only if existing SDF validates
-        if skip_if_done and sdf_is_valid(out_sdf):
+            # Always overwrite .smi for transparency
+            out_smi.parent.mkdir(parents=True, exist_ok=True)
+            out_smi.write_text(smiles + "\n", encoding="utf-8")
+
+            # Skip only if existing SDF validates
+            if skip_if_done and sdf_is_valid(out_sdf):
+                m = manifest.get(lig_id, {k:"" for k in MANIFEST_FIELDS})
+                m["id"] = lig_id
+                m["smiles"] = smiles
+                m.setdefault("created_at", created_ts)
+                m["updated_at"] = now_iso()
+                m["sdf_status"] = "DONE"
+                m["sdf_path"] = str(out_sdf)
+                m["sdf_reason"] = "Found existing valid SDF"
+                m["config_hash"] = chash
+                # Record RDKit version
+                m["tools_rdkit"] = getattr(Chem, "__version__", "RDKit")
+                manifest[lig_id] = m
+                done += 1
+                log_write(out_log, f"[SKIP] Existing valid SDF kept: {out_sdf}\n")
+                # light checkpoint: write every 50 ligs
+                if idx % 50 == 0:
+                    save_manifest(manifest)
+                continue
+
+            # Fresh RDKit build (atomic)
+            ok, reason = rdkit_make_sdf(smiles, out_sdf, ff=force_field, max_iters=minimize_steps)
+
+            # Atom count (for log)
+            atom_count = "?"
+            try:
+                if ok:
+                    suppl = Chem.SDMolSupplier(str(out_sdf), removeHs=False)
+                    mol0 = next((m for m in suppl if m is not None), None)
+                    if mol0:
+                        atom_count = str(mol0.GetNumAtoms())
+            except Exception:
+                pass
+
+            # Overwrite log each run
+            log_text = [
+                f"RDKit build for {lig_id}",
+                f"SMILES: {smiles}",
+                f"Force field: {force_field}",
+                f"Minimize steps: {minimize_steps}",
+                f"Output SDF: {out_sdf}",
+                f"Result: {'OK' if ok else 'FAIL'}; Reason: {reason}; atoms={atom_count}",
+            ]
+            log_write(out_log, "\n".join(log_text) + "\n", mode="w")
+
+            # Update manifest
             m = manifest.get(lig_id, {k:"" for k in MANIFEST_FIELDS})
             m["id"] = lig_id
             m["smiles"] = smiles
-            m.setdefault("created_at", created_ts)
+            if not m.get("created_at"):
+                m["created_at"] = created_ts
             m["updated_at"] = now_iso()
-            m["sdf_status"] = "DONE"
-            m["sdf_path"] = str(out_sdf)
-            m["sdf_reason"] = "Found existing valid SDF"
             m["config_hash"] = chash
-            # Record RDKit version
+            m["sdf_path"] = str(out_sdf)
+            m["sdf_status"] = "DONE" if ok else "FAILED"
+            m["sdf_reason"] = "OK" if ok else reason
             m["tools_rdkit"] = getattr(Chem, "__version__", "RDKit")
             manifest[lig_id] = m
-            done += 1
-            log_write(out_log, f"[SKIP] Existing valid SDF kept: {out_sdf}\n")
-            continue
 
-        # Fresh RDKit build (atomic)
-        ok, reason = rdkit_make_sdf(smiles, out_sdf, ff=force_field, max_iters=minimize_steps)
-
-        # Atom count (for log)
-        atom_count = "?"
-        try:
             if ok:
-                suppl = Chem.SDMolSupplier(str(out_sdf), removeHs=False)
-                mol0 = next((m for m in suppl if m is not None), None)
-                if mol0:
-                    atom_count = str(mol0.GetNumAtoms())
-        except Exception:
-            pass
+                done += 1
+            else:
+                failed += 1
 
-        # Overwrite log each run
-        log_text = [
-            f"RDKit build for {lig_id}",
-            f"SMILES: {smiles}",
-            f"Force field: {force_field}",
-            f"Minimize steps: {minimize_steps}",
-            f"Output SDF: {out_sdf}",
-            f"Result: {'OK' if ok else 'FAIL'}; Reason: {reason}; atoms={atom_count}",
-        ]
-        log_write(out_log, "\n".join(log_text) + "\n", mode="w")
+            # periodic checkpoint to be extra safe
+            if idx % 50 == 0:
+                save_manifest(manifest)
 
-        # Update manifest
-        m = manifest.get(lig_id, {k:"" for k in MANIFEST_FIELDS})
-        m["id"] = lig_id
-        m["smiles"] = smiles
-        if not m.get("created_at"):
-            m["created_at"] = created_ts
-        m["updated_at"] = now_iso()
-        m["config_hash"] = chash
-        m["sdf_path"] = str(out_sdf)
-        m["sdf_status"] = "DONE" if ok else "FAILED"
-        m["sdf_reason"] = "OK" if ok else reason
-        m["tools_rdkit"] = getattr(Chem, "__version__", "RDKit")
-        manifest[lig_id] = m
-
-        if ok:
-            done += 1
-        else:
-            failed += 1
-
-    save_manifest(manifest)
-    print(f"✅ RDKit SMILES→SDF complete. DONE: {done}  FAILED: {failed}")
-    print(f"   Outputs in: {DIR_SDF}")
-    print(f"   Manifest updated: {FILE_MANIFEST}")
+    finally:
+        # Always flush manifest even on Ctrl+C or unexpected exceptions
+        save_manifest(manifest)
+        print(f"✅ RDKit SMILES→SDF complete (or stopped). DONE: {done}  FAILED: {failed}")
+        print(f"   Outputs in: {DIR_SDF}")
+        print(f"   Manifest updated: {FILE_MANIFEST}")
+        if STOP_REQUESTED or HARD_STOP:
+            print("   (Exited early by user request.)")
 
 if __name__ == "__main__":
     main()
