@@ -7,9 +7,11 @@ Clean pipeline outputs for a fresh deployment.
 - Truncates CSVs to headers only (rows cleared)
 - Removes generated ligand/receptor/results files
 - Does not touch VinaConfig.txt or Vina binaries
+- Adds double confirmation before executing
 """
 
 from pathlib import Path
+import sys
 
 BASE = Path(".").resolve()
 
@@ -52,15 +54,13 @@ CSV_HEADERS = {
 def truncate_or_create_csv(file: Path, headers: list[str]):
     """Truncate CSV to headers only, or create if missing."""
     file.parent.mkdir(parents=True, exist_ok=True)
-    if file.exists():
-        file.write_text(",".join(headers) + "\n", encoding="utf-8")
-        print(f"🧹 Truncated CSV: {file}")
-    else:
-        file.write_text(",".join(headers) + "\n", encoding="utf-8")
-        print(f"📄 Created new CSV: {file}")
+    file.write_text(",".join(headers) + "\n", encoding="utf-8")
+    action = "Truncated" if file.exists() else "Created new"
+    print(f"📄 {action} CSV: {file}")
 
 
 def clean_folder(folder: Path):
+    """Recursively delete unwanted files."""
     if not folder.exists() or not folder.is_dir():
         return
     for f in folder.glob("*"):
@@ -79,7 +79,29 @@ def clean_folder(folder: Path):
             clean_folder(f)
 
 
+def confirm_action():
+    """Ask for double confirmation before proceeding."""
+    print(f"\n🔍 Base Directory: {BASE}")
+    print("This operation will:")
+    print(" - Clean folders:", ", ".join(FOLDERS_TO_CLEAN))
+    print(" - Delete .smi, .sdf, .pdbqt, .log, .tmp files")
+    print(" - Truncate or recreate manifest and result CSVs")
+    print(" - Preserve VinaConfig.txt and binaries\n")
+
+    confirm1 = input(f"Are you sure you want to purge '{BASE}'? (y/N): ").strip().lower()
+    if confirm1 != "y":
+        print("❌ Operation cancelled at first confirmation.")
+        sys.exit(0)
+
+    confirm2 = input("Really sure? This will delete files. (y/N): ").strip().lower()
+    if confirm2 != "y":
+        print("❌ Operation cancelled at second confirmation.")
+        sys.exit(0)
+
+
 def main():
+    confirm_action()
+
     # clean unwanted files
     for folder in FOLDERS_TO_CLEAN:
         clean_folder(BASE / folder)
