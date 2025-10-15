@@ -221,13 +221,18 @@ def pdbqt_is_valid(path: Path) -> bool:
 def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Path,
                     quiet: bool = True) -> tuple[bool, str]:
     """
-    Try in order:
-      1) meeko_cmd (default: mk_prepare_ligand.py.exe)
+    Cross-platform Meeko caller with widened compatibility:
+      1) meeko_cmd (from config; e.g., mk_prepare_ligand.py.exe or mk_prepare_ligand)
       2) mk_prepare_ligand
-      3) python -m meeko.cli_prepare_ligand
+      3) mk_prepare_ligand.py            # <— added for Linux/mac installs into ~/.local/bin
+      4) python -m meeko.main_prepare_ligand
+      5) python -m meeko.cli_prepare_ligand
+
     Writes to out_pdbqt.tmp first, validates, then renames.
     Returns (ok, reason)
     """
+    import shutil
+
     in_sdf = in_sdf.resolve()
     out_pdbqt = out_pdbqt.resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
@@ -253,13 +258,25 @@ def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Pa
             res = subprocess.run(cmd_list, shell=False)
         return res.returncode
 
+    # Prefer actual paths on PATH if available
+    def _maybe(cmd):
+        exe = shutil.which(cmd[0]) if len(cmd) and not os.path.sep in cmd[0] else cmd[0]
+        if exe:
+            cmd = [exe] + cmd[1:]
+        return cmd
+
+    py = python_exe or "python"
+
     candidates = [
-        [meeko_cmd, "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
-        ["mk_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
-        [python_exe, "-m", "meeko.cli_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
+        [meeko_cmd, "-i", str(in_sdf), "-o", str(tmp_pdbqt)],                # config override
+        ["mk_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],      # typical console entry
+        ["mk_prepare_ligand.py", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],   # Linux/mac in ~/.local/bin
+        [py, "-m", "meeko.main_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],  # newer module path
+        [py, "-m", "meeko.cli_prepare_ligand",  "-i", str(in_sdf), "-o", str(tmp_pdbqt)],  # legacy module path
     ]
 
-    for cmd in candidates:
+    for raw in candidates:
+        cmd = _maybe(raw)
         try:
             rc = _exec(cmd)
             if rc == 0 and pdbqt_is_valid(tmp_pdbqt):
@@ -276,7 +293,6 @@ def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Pa
     except Exception:
         pass
     return False, "All Meeko attempts failed"
-
 # ------------------------------ Worker ---------------------------------------
 
 def worker_prepare(lig_id: str, sdf_path_str: str, meeko_cmd: str, python_exe: str, quiet: bool) -> Tuple[str, bool, str, str, str]:
